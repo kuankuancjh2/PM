@@ -33,7 +33,7 @@ def default_schedule(t, K):
 
 
 class SelectiveDiffusion(nn.Module):
-    def __init__(self, K=20, D=768, hidden_dim=1024, schedule_fn=default_schedule):
+    def __init__(self, K=50, D=768, hidden_dim=1024, schedule_fn=default_schedule):
         super().__init__()
         self.K = K
         self.D = D
@@ -106,7 +106,7 @@ def train(resume_from_latest=False):
     embedder = AutoModel.from_pretrained("gpt2").to(device)
     embedder.eval()
 
-    train_set = dataset["train"].select(range(int(len(dataset["train"]) * 0.01))).with_format("torch")  # 使用1%子集训练
+    train_set = dataset["train"].select(range(int(len(dataset["train"]) * 0.03))).with_format("torch")  # 使用1%子集训练
     loader = DataLoader(train_set, batch_size=8, shuffle=True)
 
     model = SelectiveDiffusion(K=6, D=768).to(device)
@@ -151,8 +151,6 @@ def train(resume_from_latest=False):
             loss.backward()
             optimizer.step()
             scheduler.step()
-
-            tqdm.write(f"Loss: {loss.item():.4f}")
 
         torch.save(model.state_dict(), f"diff_model_epoch{epoch}.pt")
 
