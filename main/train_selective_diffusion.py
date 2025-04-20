@@ -126,6 +126,7 @@ def train(
     dataset_path = "D:/my_data/processed/tokenized_dataset"
     dataset = load_from_disk(dataset_path)
     tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=cache_dir)
+    tokenizer.pad_token = tokenizer.eos_token  # ✅ 解决 padding 报错
     embedder = AutoModel.from_pretrained("gpt2", cache_dir=cache_dir).to(device)
     embedder.eval()
 
