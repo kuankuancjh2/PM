@@ -106,7 +106,7 @@ def train(resume_from_latest=False):
     embedder = AutoModel.from_pretrained("gpt2").to(device)
     embedder.eval()
 
-    train_set = dataset["train"].select(range(int(len(dataset["train"]) * 0.02))).with_format("torch")  # 使用1%子集训练
+    train_set = dataset["train"].select(range(int(len(dataset["train"]) * 0.05))).with_format("torch")  # 使用1%子集训练
     loader = DataLoader(train_set, batch_size=8, shuffle=True)
 
     model = SelectiveDiffusion(K=6, D=768).to(device)
@@ -118,7 +118,7 @@ def train(resume_from_latest=False):
             latest_ckpt = max(checkpoints, key=lambda x: int(x.split('epoch')[1].split('.pt')[0]))
             model.load_state_dict(torch.load(latest_ckpt))
             print(f"✅ 已加载模型权重: {latest_ckpt}")
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     T = 20  # diffusion steps
     from transformers import get_cosine_schedule_with_warmup
