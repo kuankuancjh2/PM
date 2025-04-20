@@ -7,6 +7,7 @@ from datasets import load_from_disk
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from tqdm import tqdm
 import os
+import matplotlib.pyplot as plt
 
 # --- 模型结构 ---
 class SimpleDenoiser(nn.Module):
@@ -79,7 +80,7 @@ def preview_generation(zk, embedder, tokenizer, device):
         token_embeds = mlp(zk_transposed)  # (B, D, T)
         token_embeds = token_embeds.transpose(1, 2)  # (B, T, D)
 
-        decoder = AutoModelForCausalLM.from_pretrained("gpt2").to(device)
+        decoder = AutoModelForCausalLM.from_pretrained("gpt2", cache_dir="D:/hf_cache").to(device)
         decoder.eval()
 
         attention_mask = torch.ones(token_embeds.shape[:-1], dtype=torch.long).to(device)
@@ -98,18 +99,29 @@ def preview_generation(zk, embedder, tokenizer, device):
 
 
 # --- 训练过程 ---
-def train(resume_from_latest=False):
+def train(
+    resume_from_latest=True,
+    dataset_path="D:/my_data/processed/tokenized_dataset",
+    batch_size=8,
+    num_epochs=10,
+    K=6,
+    D=768,
+    T=20,
+    cache_dir="D:/hf_cache",
+    sample_pct=0.03,
+    visualize=False
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset_path = "D:/my_data/processed/tokenized_dataset"
     dataset = load_from_disk(dataset_path)
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    embedder = AutoModel.from_pretrained("gpt2").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir=cache_dir)
+    embedder = AutoModel.from_pretrained("gpt2", cache_dir=cache_dir).to(device)
     embedder.eval()
 
-    train_set = dataset["train"].select(range(int(len(dataset["train"]) * 0.03))).with_format("torch")  # 使用1%子集训练
-    loader = DataLoader(train_set, batch_size=8, shuffle=True)
+    train_set = dataset["train"].select(range(int(len(dataset["train"]) * sample_pct))).with_format("torch")  # 使用1%子集训练
+    loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
-    model = SelectiveDiffusion(K=6, D=768).to(device)
+    model = SelectiveDiffusion(K=K, D=D).to(device)
 
     # --- 如果开启恢复功能，自动加载最新模型 ---
     if resume_from_latest:
@@ -120,9 +132,9 @@ def train(resume_from_latest=False):
             print(f"✅ 已加载模型权重: {latest_ckpt}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.95), weight_decay=0.01)
 
-    T = 20  # diffusion steps
+    T = T  # diffusion steps
     from transformers import get_cosine_schedule_with_warmup
-    total_steps = len(loader) * 10  # 假设最大训练轮数为 10
+    total_steps = len(loader) * num_epochs
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(0.05 * total_steps),  # warmup 前期加速
@@ -130,7 +142,10 @@ def train(resume_from_latest=False):
         num_cycles=4
     )
 
-    for epoch in range(10):  # 可以适当延长训练轮数
+    losses = []
+    lrs = []
+
+    for epoch in range(num_epochs):
         for batch in tqdm(loader, desc=f"Epoch {epoch}"):
             zk_gt = embed_tokens(batch, embedder, tokenizer, device, K=6)
             noise = torch.randn_like(zk_gt)
@@ -152,6 +167,10 @@ def train(resume_from_latest=False):
             optimizer.step()
             scheduler.step()
 
+            # --- 日志记录 ---
+            losses.append(loss.item())
+            lrs.append(optimizer.param_groups[0]['lr'])
+
         torch.save(model.state_dict(), f"diff_model_epoch{epoch}.pt")
 
         # --- 每轮后预览生成 ---
@@ -159,7 +178,55 @@ def train(resume_from_latest=False):
         print("=== 生成预览 ===")
         for i, text in enumerate(previews):
             print(f"[Sample {i}]: {text}")
+        
+        if visualize:
+            # --- 仅可视化本轮 ---
+            epoch_losses = torch.tensor(losses[-len(loader):])
+            epoch_lrs = torch.tensor(lrs[-len(loader):])
 
+            # --- 自动对数/指数处理 ---
+            def normalize(arr):
+                if arr.max() > 10:
+                    return torch.log10(arr + 1e-8)
+                elif arr.max() < 1e-2:
+                    return torch.exp(arr)
+                return arr
+
+            plt.figure(figsize=(10, 4))
+            plt.plot(normalize(epoch_losses), label='Log-scaled Loss')
+            plt.plot(normalize(epoch_lrs), label='Log-scaled LR')
+            plt.xlabel('Step in Epoch')
+            plt.legend()
+            plt.title(f'Training Progress Epoch {epoch}')
+            plt.savefig(f'training_plot_epoch{epoch}.png')
+            plt.close()
+
+
+import argparse
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--dataset_path", type=str, default="D:/my_data/processed/tokenized_dataset")
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_epochs", type=int, default=10)
+    parser.add_argument("--K", type=int, default=6)
+    parser.add_argument("--D", type=int, default=768)
+    parser.add_argument("--T", type=int, default=20)
+    parser.add_argument("--cache_dir", type=str, default="D:/hf_cache")
+    parser.add_argument("--sample_pct", type=float, default=0.03)
+    parser.add_argument("--visualize", action="store_true", help="Visualize training progress")
+    args = parser.parse_args()
+
+    train(
+        resume_from_latest=args.resume,
+        dataset_path=args.dataset_path,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        K=args.K,
+        D=args.D,
+        T=args.T,
+        cache_dir=args.cache_dir,
+        sample_pct=args.sample_pct,
+        visualize=args.visualize
+    )
