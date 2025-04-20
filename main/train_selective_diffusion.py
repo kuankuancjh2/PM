@@ -14,16 +14,21 @@ class SimpleDenoiser(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim + 1, hidden_dim),
+            nn.Linear(dim + 1 + dim, hidden_dim),  # +prompt embedding
             nn.ReLU(),
             nn.Linear(hidden_dim, dim)
         )
 
-    def forward(self, z, t):
+    def forward(self, z, t, prompt_embed=None):
         B, K, D = z.shape
         t_embed = t / 1000.0
         t_embed = torch.full((B, K, 1), t_embed, device=z.device)
-        x = torch.cat([z, t_embed], dim=-1)
+
+        if prompt_embed is None:
+            prompt_embed = torch.zeros((B, 1, D), device=z.device)
+        prompt_broadcast = prompt_embed.expand(B, K, D)
+
+        x = torch.cat([z, t_embed, prompt_broadcast], dim=-1)
         return self.net(x)
 
 
@@ -41,15 +46,20 @@ class SelectiveDiffusion(nn.Module):
         self.schedule_fn = schedule_fn
         self.denoiser = SimpleDenoiser(D, hidden_dim)
 
-    def forward(self, z_noisy, t):
+    def forward(self, z_noisy, t, prompt_embed=None):
         B, K, D = z_noisy.shape
         active_mask = self.schedule_fn(t, K).to(z_noisy.device)
         active_mask = active_mask.unsqueeze(0).unsqueeze(-1)
         z_input = z_noisy * active_mask
-        z_denoised = self.denoiser(z_input, t)
+        z_denoised = self.denoiser(z_input, t, prompt_embed)
         z_updated = z_noisy * (~active_mask) + z_denoised * active_mask
         return z_updated
 
+
+# --- Prompt 作为条件输入的三种方式 ---
+# 1. (✅ 已实现) 条件嵌入 prompt_embed 作为 denoiser 输入
+# 2. prompt 作为 zk[0]，其余 zk 去噪，prompt zk 固定
+# 3. classifier-free guidance：生成时做两次去噪，条件引导 scale
 
 # --- 数据准备 ---
 def embed_tokens(batch, embedder, tokenizer, device, K=6):
@@ -101,16 +111,16 @@ def preview_generation(zk, embedder, tokenizer, device):
 
 # --- 训练过程 ---
 def train(
-    resume_from_latest=True,
-    dataset_path="D:/my_data/processed/tokenized_dataset",
-    batch_size=8,
-    num_epochs=3,
-    K=6,
-    D=768,
-    T=20,
-    cache_dir="D:/hf_cache",
-    sample_pct=0.03,
-    visualize=False
+    resume_from_latest,
+    dataset_path,
+    batch_size,
+    num_epochs,
+    K,
+    D,
+    T,
+    cache_dir,
+    sample_pct,
+    visualize
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset_path = "D:/my_data/processed/tokenized_dataset"
@@ -148,13 +158,24 @@ def train(
 
     for epoch in range(num_epochs):
         for batch in tqdm(loader, desc=f"Epoch {epoch}"):
+            use_condition = torch.rand(1).item() > 0.1  # 90% 概率使用 prompt
             zk_gt = embed_tokens(batch, embedder, tokenizer, device, K=6)
             noise = torch.randn_like(zk_gt)
             zk_noisy = zk_gt + noise
             zk_pred = zk_noisy.clone()
 
+            # --- 条件 prompt embedding ---
+            if use_condition:
+                texts = tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
+                prompts = [tokenizer.convert_tokens_to_string(tokenizer.tokenize(t)[:8]) for t in texts]  # 前8个完整token
+                prompt_ids = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).input_ids.to(device)
+                with torch.no_grad():
+                    prompt_embed = embedder(input_ids=prompt_ids).last_hidden_state.mean(dim=1).unsqueeze(1)  # (B, 1, D)
+            else:
+                prompt_embed = None
+
             for t in range(T):
-                zk_pred = model(zk_pred, t)
+                                zk_pred = model(zk_pred, t, prompt_embed)
 
             loss = F.mse_loss(zk_pred, zk_gt)
 
@@ -211,11 +232,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, default="D:/my_data/processed/tokenized_dataset")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=10)
-    parser.add_argument("--K", type=int, default=6)
+    parser.add_argument("--K", type=int, default=40)
     parser.add_argument("--D", type=int, default=768)
     parser.add_argument("--T", type=int, default=20)
     parser.add_argument("--cache_dir", type=str, default="D:/hf_cache")
-    parser.add_argument("--sample_pct", type=float, default=0.03)
+    parser.add_argument("--sample_pct", type=float, default=0.02)
     parser.add_argument("--visualize", action="store_true", help="Visualize training progress")
     args = parser.parse_args()
 
