@@ -92,7 +92,8 @@ def preview_generation(zk, embedder, tokenizer, device):
             do_sample=True,
             top_k=50,
             top_p=0.95,
-            temperature=1.0
+            temperature=1.0,
+            repetition_penalty=1.2
         )
         texts = tokenizer.batch_decode(output, skip_special_tokens=True)
         return texts
@@ -103,7 +104,7 @@ def train(
     resume_from_latest=True,
     dataset_path="D:/my_data/processed/tokenized_dataset",
     batch_size=8,
-    num_epochs=10,
+    num_epochs=3,
     K=6,
     D=768,
     T=20,
