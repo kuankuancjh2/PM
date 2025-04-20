@@ -118,16 +118,16 @@ def train(resume_from_latest=False):
             latest_ckpt = max(checkpoints, key=lambda x: int(x.split('epoch')[1].split('.pt')[0]))
             model.load_state_dict(torch.load(latest_ckpt))
             print(f"✅ 已加载模型权重: {latest_ckpt}")
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.95), weight_decay=0.01)
 
     T = 20  # diffusion steps
     from transformers import get_cosine_schedule_with_warmup
     total_steps = len(loader) * 10  # 假设最大训练轮数为 10
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(0.1 * total_steps),
+        num_warmup_steps=int(0.05 * total_steps),  # warmup 前期加速
         num_training_steps=total_steps,
-        num_cycles=0.5
+        num_cycles=4
     )
 
     for epoch in range(10):  # 可以适当延长训练轮数
