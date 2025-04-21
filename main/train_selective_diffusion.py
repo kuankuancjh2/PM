@@ -20,6 +20,8 @@ class SimpleDenoiser(nn.Module):
         )
 
     def forward(self, z, t, prompt_embed=None):
+        if z.dim() == 2:  # 如果输入是 (B, D)，加一维变成 (B, 1, D)
+            z = z.unsqueeze(1)
         B, K, D = z.shape
         t_embed = t / 1000.0
         t_embed = torch.full((B, K, 1), t_embed, device=z.device)
@@ -29,14 +31,14 @@ class SimpleDenoiser(nn.Module):
         prompt_broadcast = prompt_embed.expand(B, K, D)
 
         x = torch.cat([z, t_embed, prompt_broadcast], dim=-1)
-        return self.net(x)
+        return self.net(x).squeeze(1)  # 去掉 K=1 维度，返回 (B, D)
 
 
 def default_schedule(t, K):
     # 粗细交替策略：
     # 偶数 t：全部激活（粗）
     # 奇数 t：只激活一个 zk（细）
-    if t % 2 == 0:
+    if t % 8 == 0:  #过小会降低模型稳定性，以及loss难以下降等等
         return torch.ones(K, dtype=torch.bool)
     else:
         active = torch.zeros(K, dtype=torch.bool)
@@ -58,18 +60,28 @@ class SelectiveDiffusion(nn.Module):
         active_mask = active_mask.unsqueeze(0).unsqueeze(-1)
         z_input = z_noisy * active_mask
         z_denoised = torch.zeros_like(z_noisy)
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        max_memory = total_memory * 0.85
+
         for i in range(K):
             if active_mask[0, i, 0]:
-                try:
-                    self.denoisers[i] = self.denoisers[i].to(z_noisy.device)
-                    z_denoised[:, i, :] = self.denoisers[i](z_input[:, i:i+1, :], t, prompt_embed)
-                    torch.cuda.empty_cache()
-                except RuntimeError as e:
-                    print(f"❌ 显存不足，正在卸载 denoiser[{i}] 重试：{e}")
-                    torch.cuda.empty_cache()
-                    self.denoisers[i] = self.denoisers[i].cpu()
-                    self.denoisers[i] = self.denoisers[i].to(z_noisy.device)
-                    z_denoised[:, i, :] = self.denoisers[i](z_input[:, i:i+1, :], t, prompt_embed)
+                current_memory = torch.cuda.memory_allocated()
+                #print("current_memory:", current_memory, max_memory)
+                while current_memory > max_memory:
+                    print(f"❌ 显存使用超过 85%，正在卸载 denoiser 以释放显存...")
+                    # 卸载一些未使用的 denoiser
+                    for j in range(K):
+                        if j != i and self.denoisers[j].device.type == 'cuda':
+                            self.denoisers[j] = self.denoisers[j].cpu()
+                            torch.cuda.empty_cache()
+                            current_memory = torch.cuda.memory_allocated()
+                            if current_memory <= max_memory:
+                                break
+
+                self.denoisers[i] = self.denoisers[i].to(z_noisy.device)
+                z_denoised[:, i, :] = self.denoisers[i](z_input[:, i:i+1, :], t, prompt_embed)
+                torch.cuda.empty_cache()
+
         z_updated = z_noisy * (~active_mask) + z_denoised * active_mask
         return z_updated
 
