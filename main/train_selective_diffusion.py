@@ -33,25 +33,43 @@ class SimpleDenoiser(nn.Module):
 
 
 def default_schedule(t, K):
-    active = torch.zeros(K, dtype=torch.bool)
-    active[t % K] = True
-    return active
+    # 粗细交替策略：
+    # 偶数 t：全部激活（粗）
+    # 奇数 t：只激活一个 zk（细）
+    if t % 2 == 0:
+        return torch.ones(K, dtype=torch.bool)
+    else:
+        active = torch.zeros(K, dtype=torch.bool)
+        active[t % K] = True
+        return active
 
 
 class SelectiveDiffusion(nn.Module):
-    def __init__(self, K=50, D=768, hidden_dim=1024, schedule_fn=default_schedule):
+    def __init__(self, K, D, hidden_dim=1024, schedule_fn=default_schedule):
         super().__init__()
         self.K = K
         self.D = D
         self.schedule_fn = schedule_fn
-        self.denoiser = SimpleDenoiser(D, hidden_dim)
+        self.denoisers = nn.ModuleList([SimpleDenoiser(D, hidden_dim) for _ in range(K)])
 
     def forward(self, z_noisy, t, prompt_embed=None):
         B, K, D = z_noisy.shape
         active_mask = self.schedule_fn(t, K).to(z_noisy.device)
         active_mask = active_mask.unsqueeze(0).unsqueeze(-1)
         z_input = z_noisy * active_mask
-        z_denoised = self.denoiser(z_input, t, prompt_embed)
+        z_denoised = torch.zeros_like(z_noisy)
+        for i in range(K):
+            if active_mask[0, i, 0]:
+                try:
+                    self.denoisers[i] = self.denoisers[i].to(z_noisy.device)
+                    z_denoised[:, i, :] = self.denoisers[i](z_input[:, i:i+1, :], t, prompt_embed)
+                    torch.cuda.empty_cache()
+                except RuntimeError as e:
+                    print(f"❌ 显存不足，正在卸载 denoiser[{i}] 重试：{e}")
+                    torch.cuda.empty_cache()
+                    self.denoisers[i] = self.denoisers[i].cpu()
+                    self.denoisers[i] = self.denoisers[i].to(z_noisy.device)
+                    z_denoised[:, i, :] = self.denoisers[i](z_input[:, i:i+1, :], t, prompt_embed)
         z_updated = z_noisy * (~active_mask) + z_denoised * active_mask
         return z_updated
 
