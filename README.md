@@ -1,17 +1,11 @@
 # PM
 
-idk why and when i give it such a name...
+# 響-hibiki
 
-It's a diffusion model for language, but i used multidenoiser.
+hibiki.py is the recent project, and the other 2 are abandoned.
 
-It doesn't works very very well, but already out of my exceptation.
+I trained it with my poor 1650, and it completly out of my exception----IT JUST GIVE MY THE TEXT RIGHT IN THE DATASET.
 
-Recently, I use my poor 1650 trained it for about 8mins, and got a min loss of about 0.07
+It's uplifting.
 
-Thus, it can produce some abstract words, but still need to be improved, or scaled?
-
-So, just Enjoy it.
-
-(My poor English...)
-
-thanks chatGPT-4o, it's powerful.
+(my En is poor, idk if there is anything wrong.)
