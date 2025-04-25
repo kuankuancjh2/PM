@@ -108,7 +108,7 @@ class Expert(nn.Module):
 # === 主模型结构 ===
 
 class DiffusionTextModel(nn.Module):
-    def __init__(self, latent_dim, prompt_dim, num_experts, vocab_size):
+    def __init__(self, latent_dim, prompt_dim, num_experts, vocab_size, embedder):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_experts = num_experts
@@ -121,6 +121,8 @@ class DiffusionTextModel(nn.Module):
         self.mask_decoder = MaskDecoder(latent_dim, num_experts)
 
         self.text_decoder = nn.Linear(latent_dim, vocab_size)
+        
+        self.embedder = embedder
 
     def forward(self, L, mL, prompt):
         L = self.qa(L, torch.cat([prompt, mL], dim=-1))
@@ -171,7 +173,7 @@ def compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_targe
 
 # === 训练循环 ===
 
-def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, preview_interval=1, num_epochs=100, save_path="checkpoint"):
+def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=100, save_path="checkpoint"):
     model.train()
     step = 0
     os.makedirs(save_path, exist_ok=True)
@@ -191,7 +193,7 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, pr
             loss.backward()
             optimizer.step()
 
-        if epoch % preview_interval == 0:
+        if epoch % 5 == 0:
             print(f"Epoch {epoch} Step {step}: Loss = {loss.item():.4f}")
             sample_prompt = batch['original_text'][:2]
             sampled_texts = generate_text(model, sample_prompt, tokenizer, n_steps=20, device=device)
@@ -208,7 +210,7 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, pr
                     weights = example_mask[pos].cpu().numpy()
                     print(f"  Position {pos} expert weights: {weights}")
 
-        if epoch % 50 == 0:
+        if epoch % 50 == 0  and epoch >= 100:
             ckpt = os.path.join(save_path, f"model_epoch{epoch}.pt")
             torch.save(model.state_dict(), ckpt)
             print(f"Saved checkpoint to {ckpt}")
@@ -261,9 +263,10 @@ def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu'):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample_pct", type=float, default=0.1)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--save_path", type=str, default="checkpoint")
+    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,7 +282,7 @@ def main():
     prompt_dim = latent_dim
     num_experts = 12
     vocab_size = tokenizer.vocab_size
-    model = DiffusionTextModel(latent_dim, prompt_dim, num_experts, vocab_size).to(device)
+    model = DiffusionTextModel(latent_dim, prompt_dim, num_experts, vocab_size, embedder=embedder).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     lambda_dict = {
@@ -289,8 +292,15 @@ def main():
         'diversity': 0.1,
         'contrast': 0.1
     }
+    
+    if args.resume:
+        ckpt_files = sorted([f for f in os.listdir(args.save_path) if f.endswith(".pt")])
+        if ckpt_files:
+            latest_ckpt = os.path.join(args.save_path, ckpt_files[-1])
+            model.load_state_dict(torch.load(latest_ckpt))
+            print(f"✅ Resumed model from {latest_ckpt}")
 
-    train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, preview_interval=10, num_epochs=args.epochs, save_path=args.save_path)
+    train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=args.epochs, save_path=args.save_path)
 
 if __name__ == "__main__":
     main()
