@@ -27,17 +27,15 @@ class DiffusionDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        input_ids = item['input_ids'][:self.max_length]
-        original_text = self.tokenizer.decode(input_ids)
+        input_ids = item['input_ids'][:self.max_length].clone()
+        attention_mask = item['attention_mask'][:self.max_length].clone()
+
+        original_text = self.tokenizer.decode(input_ids, skip_special_tokens=True)
 
         if np.random.rand() < 0.1:
             replace_indices = np.random.choice(len(input_ids), size=2, replace=False)
             for i in replace_indices:
                 input_ids[i] = np.random.randint(self.tokenizer.vocab_size)
-
-        if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids)
-        attention_mask = torch.tensor(item['attention_mask'][:self.max_length])
 
         inputs = {
             'input_ids': input_ids.unsqueeze(0).to(self.device),
@@ -125,21 +123,31 @@ class DiffusionTextModel(nn.Module):
         self.embedder = embedder
 
     def forward(self, L, mL, prompt):
+        # mL 表示模型记忆，可视为对当前对话上下文的内隐表示
+        # prompt 表示当前输入（本轮对话）
+
+        # 1. 用 mL 和 prompt 生成本轮的 L（内容生成基础）
         L = self.qa(L, torch.cat([prompt, mL], dim=-1))
+
+        # 2. 对 L 加噪，生成 sL，输入给 mask 解码器
         sL = self.qb(torch.randn_like(L), torch.cat([prompt, L], dim=-1))
         mask = self.mask_decoder(sL)
 
+        # 3. 用 mask 混合多个专家输出
         expert_outputs = []
         for k, qk in enumerate(self.qk_pool):
             out = qk(L)
             expert_outputs.append(out.unsqueeze(-2))
         expert_outputs = torch.cat(expert_outputs, dim=-2)
+        qk_output = (expert_outputs * mask.unsqueeze(-1)).sum(dim=-2)
 
-        mask_expanded = mask.unsqueeze(-1)
-        qk_output = (expert_outputs * mask_expanded).sum(dim=-2)
-
+        # 4. 再次精炼 L，同时保持 mL 参与其中
         L = self.qa(qk_output, torch.cat([prompt, mL], dim=-1))
+
+        # 5. 更新对话上下文记忆 mL
         mL_pred = self.qc(mL, torch.cat([prompt, L], dim=-1))
+
+        # 6. 最终解码生成文本
         text_logits = self.text_decoder(L)
 
         return L, mL_pred, mask, text_logits, expert_outputs
@@ -173,11 +181,11 @@ def compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_targe
 
 # === 训练循环 ===
 
-def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=100, save_path="checkpoint"):
+def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=100, previous_epoch=0, save_path="checkpoint"):
     model.train()
     step = 0
     os.makedirs(save_path, exist_ok=True)
-    for epoch in range(num_epochs):
+    for epoch in range(previous_epoch, num_epochs):
         for batch in dataloader:
             L = batch['L'].to(device)
             mL = batch['mL'].to(device)
@@ -193,7 +201,7 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, nu
             loss.backward()
             optimizer.step()
 
-        if epoch % 5 == 0:
+        if epoch % 10 == 0:
             print(f"Epoch {epoch} Step {step}: Loss = {loss.item():.4f}")
             sample_prompt = batch['original_text'][:2]
             sampled_texts = generate_text(model, sample_prompt, tokenizer, n_steps=20, device=device)
@@ -237,8 +245,9 @@ def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu', temp
     inputs = tokenizer(prompt_texts, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
     prompt_emb = model.embedder(**inputs).last_hidden_state
 
+    # mL 初始化为空记忆；一次 session 中可复用
+    mL = torch.zeros_like(prompt_emb).to(device)
     latent = torch.randn_like(prompt_emb).to(device)
-    mL = torch.randn_like(prompt_emb).to(device)
 
     for step in range(n_steps):
         L = model.qa(latent, torch.cat([prompt_emb, mL], dim=-1))
@@ -253,7 +262,7 @@ def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu', temp
         qk_output = (expert_outputs * mask.unsqueeze(-1)).sum(dim=-2)
 
         latent = model.qa(qk_output, torch.cat([prompt_emb, mL], dim=-1))
-        mL = model.qc(mL, torch.cat([prompt_emb, latent], dim=-1))
+        mL = model.qc(mL, torch.cat([prompt_emb, latent], dim=-1))  # 更新记忆 mL
 
     logits = model.text_decoder(latent)
     probs = torch.softmax(logits / temperature, dim=-1)
@@ -267,7 +276,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--save_path", type=str, default="checkpoint")
-    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
+    parser.add_argument("--resume", action="store_false", help="Resume training from last checkpoint")
     args = parser.parse_args()  
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -275,7 +284,13 @@ def main():
     embedder = AutoModel.from_pretrained("bert-base-uncased", cache_dir="D:/my_data/hf_cache").to(device)
 
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1%]", cache_dir="D:/my_data/hf_cache")
-    tokenized = dataset.map(lambda e: tokenizer(e['text'], truncation=True, padding="max_length", max_length=128), batched=True)
+    
+    
+    tokenized = dataset.map(
+        lambda e: tokenizer(e['text'], truncation=True, padding="max_length", max_length=128),
+        batched=True,
+        remove_columns=['text']  # 可选，清理原始字段
+    ).with_format("torch")
     diffusion_dataset = DiffusionDataset(tokenized, embedder, tokenizer, max_length=128, device=device, sample_pct=args.sample_pct)
     dataloader = DataLoader(diffusion_dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -294,14 +309,29 @@ def main():
         'contrast': 0.1
     }
     
+    previous_epoch = 0
+                
     if args.resume:
-        ckpt_files = sorted([f for f in os.listdir(args.save_path) if f.endswith(".pt")])
+        ckpt_files = [f for f in os.listdir(args.save_path) if f.endswith(".pt")]
         if ckpt_files:
-            latest_ckpt = os.path.join(args.save_path, ckpt_files[-1])
-            model.load_state_dict(torch.load(latest_ckpt))
-            print(f"✅ Resumed model from {latest_ckpt}")
+            # Extract epoch numbers and find the maximum
+            max_epoch = -1
+            latest_ckpt = None
+            for f in ckpt_files:
+                try:
+                    epoch = int(f.split("_")[-1].split(".")[0][5:])  # Assuming format like "model_epochXX.pt"
+                    if epoch > max_epoch:
+                        max_epoch = epoch
+                        latest_ckpt = f
+                except (IndexError, ValueError):
+                    continue
+            
+            if latest_ckpt:
+                latest_ckpt_path = os.path.join(args.save_path, latest_ckpt)
+                model.load_state_dict(torch.load(latest_ckpt_path))
+                print(f"✅ Resumed model from {latest_ckpt_path}")
 
-    train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=args.epochs, save_path=args.save_path)
+    train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=args.epochs + previous_epoch, previous_epoch=previous_epoch, save_path=args.save_path)
 
 if __name__ == "__main__":
     main()
