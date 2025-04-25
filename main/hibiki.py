@@ -202,7 +202,7 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, nu
                 print(f"[Generated {i}] {txt}")
             step += 1
 
-        if epoch % 5 == 0:
+        if epoch % 20 == 0:
             print(f"\n[Epoch {epoch}] Lambda weights: {lambda_dict}")
             with torch.no_grad():
                 example_mask = mask[0]
@@ -232,7 +232,7 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, nu
                 print("Prompting skipped.", e)
 
 @torch.no_grad()
-def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu'):
+def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu', temperature=1.0):
     model.eval()
     inputs = tokenizer(prompt_texts, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
     prompt_emb = model.embedder(**inputs).last_hidden_state
@@ -256,8 +256,9 @@ def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu'):
         mL = model.qc(mL, torch.cat([prompt_emb, latent], dim=-1))
 
     logits = model.text_decoder(latent)
-    ids = torch.argmax(logits, dim=-1)
-    texts = [tokenizer.decode(x, skip_special_tokens=True) for x in ids]
+    probs = torch.softmax(logits / temperature, dim=-1)
+    ids = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1).view(probs.size(0), -1)
+    texts = [tokenizer.decode(x.tolist(), skip_special_tokens=True) for x in ids]
     return texts
 
 def main():
@@ -267,7 +268,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--save_path", type=str, default="checkpoint")
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
-    args = parser.parse_args()
+    args = parser.parse_args()  
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="D:/my_data/hf_cache")
