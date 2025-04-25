@@ -5,7 +5,9 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from datasets import load_dataset
-
+import argparse
+import os
+import time
 
 # === 数据集定义 ===
 
@@ -169,42 +171,70 @@ def compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_targe
 
 # === 训练循环 ===
 
-def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, preview_interval=100):
+def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, preview_interval=1, num_epochs=100, save_path="checkpoint"):
     model.train()
-    for step, batch in enumerate(dataloader):
-        L = batch['L'].to(device)
-        mL = batch['mL'].to(device)
-        prompt = batch['prompt'].to(device)
-        text_target = batch['text'].to(device)
-        L_target = batch['L_target'].to(device)
-        mL_target = batch['mL_target'].to(device)
+    step = 0
+    os.makedirs(save_path, exist_ok=True)
+    for epoch in range(num_epochs):
+        for batch in dataloader:
+            L = batch['L'].to(device)
+            mL = batch['mL'].to(device)
+            prompt = batch['prompt'].to(device)
+            text_target = batch['text'].to(device)
+            L_target = batch['L_target'].to(device)
+            mL_target = batch['mL_target'].to(device)
 
-        optimizer.zero_grad()
-        L_pred, mL_pred, mask, text_logits, expert_outputs = model(L, mL, prompt)
+            optimizer.zero_grad()
+            L_pred, mL_pred, mask, text_logits, expert_outputs = model(L, mL, prompt)
 
-        loss = compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_target, mask, expert_outputs, lambda_dict)
-        loss.backward()
-        optimizer.step()
+            loss = compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_target, mask, expert_outputs, lambda_dict)
+            loss.backward()
+            optimizer.step()
 
-        if step % preview_interval == 0:
-            print(f"Step {step}: Loss = {loss.item():.4f}")
-            #preds = torch.argmax(text_logits, dim=-1)
-            #for i in range(min(1, preds.size(0))):
-            #    print("[Preview] Text:", tokenizer.decode(preds[i]))
-            
-            sample_prompt = batch['prompt'][:2].to(device)
-            sampled_texts = generate_text(model, sample_prompt, tokenizer, n_steps=100, device=device)
+        if epoch % preview_interval == 0:
+            print(f"Epoch {epoch} Step {step}: Loss = {loss.item():.4f}")
+            sample_prompt = batch['original_text'][:2]
+            sampled_texts = generate_text(model, sample_prompt, tokenizer, n_steps=20, device=device)
             for i, txt in enumerate(sampled_texts):
-                try:
-                    print(f"[Prompt {i}] {tokenizer.decode(batch['prompt'][i], skip_special_tokens=True)}")
-                except Exception as e:
-                    print (f"[Prompt {i}] {e}")
-                print(f"[Sample {i}] {txt}")
+                print(f"[Prompt {i}] {sample_prompt[i]}")
+                print(f"[Generated {i}] {txt}")
+            step += 1
 
+        if epoch % 5 == 0:
+            print(f"\n[Epoch {epoch}] Lambda weights: {lambda_dict}")
+            with torch.no_grad():
+                example_mask = mask[0]
+                for pos in range(min(3, example_mask.size(0))):
+                    weights = example_mask[pos].cpu().numpy()
+                    print(f"  Position {pos} expert weights: {weights}")
+
+        if epoch % 50 == 0:
+            ckpt = os.path.join(save_path, f"model_epoch{epoch}.pt")
+            torch.save(model.state_dict(), ckpt)
+            print(f"Saved checkpoint to {ckpt}")
+
+            print("Input a prompt within 20s to test generation (or wait to continue):")
+            print("Type 'exit' to stop prompt input and continue training.")
+            try:
+                start_time = time.time()
+                while True:
+                    if time.time() - start_time > 20:
+                        break
+                    prompt = input("Prompt: ")
+                    if prompt.strip().lower() == "exit":
+                        break
+                    if prompt.strip():
+                        result = generate_text(model, [prompt], tokenizer, n_steps=30, device=device)
+                        print("\nGenerated text:", result[0])
+            except Exception as e:
+                print("Prompting skipped.", e)
 
 @torch.no_grad()
-def generate_text(model, prompt_emb, tokenizer, n_steps=100, device='cuda' if torch.cuda.is_available() else 'cpu', max_len=128):
+def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu'):
     model.eval()
+    inputs = tokenizer(prompt_texts, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
+    prompt_emb = model.embedder(**inputs).last_hidden_state
+
     latent = torch.randn_like(prompt_emb).to(device)
     mL = torch.randn_like(prompt_emb).to(device)
 
@@ -229,26 +259,28 @@ def generate_text(model, prompt_emb, tokenizer, n_steps=100, device='cuda' if to
     return texts
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample_pct", type=float, default=0.1)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--save_path", type=str, default="checkpoint")
+    args = parser.parse_args()
 
-    # 加载Tokenizer与Embedder
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="D:/my_data/hf_cache")
     embedder = AutoModel.from_pretrained("bert-base-uncased", cache_dir="D:/my_data/hf_cache").to(device)
 
-    # 加载与预处理数据
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1%]", cache_dir="D:/my_data/hf_cache")  # 用较小数据子集调试
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1%]", cache_dir="D:/my_data/hf_cache")
     tokenized = dataset.map(lambda e: tokenizer(e['text'], truncation=True, padding="max_length", max_length=128), batched=True)
-    diffusion_dataset = DiffusionDataset(tokenized, embedder, tokenizer, max_length=128, device=device, sample_pct=0.1)
-    dataloader = DataLoader(diffusion_dataset, batch_size=8, shuffle=True)
+    diffusion_dataset = DiffusionDataset(tokenized, embedder, tokenizer, max_length=128, device=device, sample_pct=args.sample_pct)
+    dataloader = DataLoader(diffusion_dataset, batch_size=args.batch_size, shuffle=True)
 
-    # 初始化模型
     latent_dim = embedder.config.hidden_size
     prompt_dim = latent_dim
     num_experts = 12
     vocab_size = tokenizer.vocab_size
     model = DiffusionTextModel(latent_dim, prompt_dim, num_experts, vocab_size).to(device)
 
-    # 优化器与权重系数
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     lambda_dict = {
         'mL': 1.0,
@@ -258,12 +290,7 @@ def main():
         'contrast': 0.1
     }
 
-    num_epochs = 1000
-    
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}")
-        # 开始训练
-        train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, preview_interval=10)
+    train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, preview_interval=10, num_epochs=args.epochs, save_path=args.save_path)
 
 if __name__ == "__main__":
     main()
