@@ -4,10 +4,6 @@ import argparse
 from transformers import AutoTokenizer, AutoModel
 from hibiki import DiffusionTextModel, generate_text
 
-def find_latest_ckpt(path):
-    ckpts = sorted([f for f in os.listdir(path) if f.endswith(".pt")])
-    return os.path.join(path, ckpts[-1]) if ckpts else None
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_path", type=str, default="checkpoint")
@@ -24,12 +20,25 @@ def main():
     vocab_size = tokenizer.vocab_size
     model = DiffusionTextModel(latent_dim, latent_dim, num_experts, vocab_size, embedder).to(device)
 
-    ckpt = find_latest_ckpt(args.save_path)
-    if not ckpt:
-        print(f"No checkpoint found in {args.save_path}")
-        return
-    model.load_state_dict(torch.load(ckpt))
-    print(f"✅ Loaded checkpoint: {ckpt}")
+    ckpts = sorted([f for f in os.listdir(args.save_path) if f.endswith(".pt")])
+    if ckpts:
+        # Extract epoch numbers and find the maximum
+        max_epoch = -1
+        latest_ckpt = None
+        for f in ckpts:
+            try:
+                epoch = int(f.split("_")[-1].split(".")[0][5:])
+                if epoch > max_epoch:
+                    max_epoch = epoch
+                    latest_ckpt = f
+            except (IndexError, ValueError):
+                continue
+    
+    if latest_ckpt:
+        latest_ckpt_path = os.path.join(args.save_path, latest_ckpt)
+        print(f"Resuming model from {latest_ckpt_path}")
+        model.load_state_dict(torch.load(latest_ckpt_path))
+        print(f"✅ Resumed model from {latest_ckpt_path}")
 
     while True:
         prompt = input("Enter a prompt (or type 'exit'): ").strip()

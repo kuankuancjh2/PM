@@ -183,7 +183,6 @@ def compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_targe
 
 def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=100, previous_epoch=0, save_path="checkpoint"):
     model.train()
-    step = 0
     os.makedirs(save_path, exist_ok=True)
     for epoch in range(previous_epoch, num_epochs):
         for batch in dataloader:
@@ -202,13 +201,12 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, nu
             optimizer.step()
 
         if epoch % 10 == 0:
-            print(f"Epoch {epoch} Step {step}: Loss = {loss.item():.4f}")
+            print(f"Epoch {epoch}: Loss = {loss.item():.4f}")
             sample_prompt = batch['original_text'][:2]
             sampled_texts = generate_text(model, sample_prompt, tokenizer, n_steps=20, device=device)
             for i, txt in enumerate(sampled_texts):
                 print(f"[Prompt {i}] {sample_prompt[i]}")
                 print(f"[Generated {i}] {txt}")
-            step += 1
 
         if epoch % 20 == 0:
             print(f"\n[Epoch {epoch}] Lambda weights: {lambda_dict}")
@@ -236,6 +234,7 @@ def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, nu
                     if prompt.strip():
                         result = generate_text(model, [prompt], tokenizer, n_steps=30, device=device)
                         print("\nGenerated text:", result[0])
+                        start_time = time.time()
             except Exception as e:
                 print("Prompting skipped.", e)
 
@@ -310,6 +309,7 @@ def main():
     }
     
     previous_epoch = 0
+    args.resume = False
                 
     if args.resume:
         ckpt_files = [f for f in os.listdir(args.save_path) if f.endswith(".pt")]
