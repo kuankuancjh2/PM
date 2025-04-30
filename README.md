@@ -2,10 +2,8 @@
 
 # 響-hibiki
 
-hibiki.py is the recent project, and the other 2 are abandoned.
+now updated, but needs more tests.
 
-I trained it with my poor 1650, and it completly out of my exception----IT JUST GIVE MY THE TEXT RIGHT IN THE DATASET.
+it's an MoE Diffusion Language T2T Model(EDL?).
 
-It's uplifting.
-
-(my En is poor, idk if there is anything wrong.)
+enjoy it.
