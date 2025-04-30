@@ -39,11 +39,13 @@ class PreEmbedDataset(Dataset):
             'response_ids': encoded_response['input_ids'].squeeze(0)
         }
 
-def load_everyday_conversations_ja(tokenizer, embedder, device, max_length=128):
+def load_everyday_conversations_ja(tokenizer, embedder, device, max_length=128, percentage=[0, 0.1]):
     dataset = load_dataset("U23-lab/everyday_conversations_ja", split="train")
     prompts, responses = [], []
     for i, row in enumerate(dataset):
-        if i >= len(dataset) * 0.02:  # 只取前5%的数据
+        if i < len(dataset) * percentage[0]:
+            continue
+        if i >= len(dataset) * percentage[1]:
             break
         try:
             topic = row["topic"].strip()
@@ -146,7 +148,7 @@ def train(args, start_epoch=0, target_epoch=1000):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
     embedder = AutoModel.from_pretrained(args.model_name, cache_dir=args.cache_dir).to(device).eval()
 
-    dataset = load_everyday_conversations_ja(tokenizer, embedder, device, max_length=args.max_length)
+    dataset = load_everyday_conversations_ja(tokenizer, embedder, device, max_length=args.max_length, percentage=args.data_percentage)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
 
     model = DiffusionTextModel(embedder.config.hidden_size, embedder.config.hidden_size, args.num_experts, tokenizer.vocab_size, args.max_length, args.batch_size).to(device)
@@ -265,6 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_text", type=float, default=1.0)
     parser.add_argument("--lambda_entropy", type=float, default=0.1)
     parser.add_argument("--lambda_diversity", type=float, default=0.1)
+    parser.add_argument("--data_percentage", type=list, default=[0.1, 0.15])
 
     args = parser.parse_args([])
 
