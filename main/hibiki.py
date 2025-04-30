@@ -2,336 +2,286 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from datasets import load_dataset
 import argparse
 import os
 import time
+import logging
 
-# === 数据集定义 ===
-
-class DiffusionDataset(Dataset):
-    def __init__(self, tokenized_data, embedder, tokenizer, max_length=128, device='cpu', sample_pct=1.0):
-        self.data = list(tokenized_data)
-        if sample_pct < 1.0:
-            sample_len = int(len(self.data) * sample_pct)
-            self.data = self.data[:sample_len]
-        self.embedder = embedder
+class PreEmbedDataset(Dataset):
+    def __init__(self, prompts, responses, tokenizer, embedder, device, max_length=128):
         self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.embedder = embedder
         self.device = device
+        self.prompts = prompts
+        self.responses = responses
+        self.max_length = max_length
 
     def __len__(self):
-        return len(self.data)
+        return len(self.prompts)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        input_ids = item['input_ids'][:self.max_length].clone()
-        attention_mask = item['attention_mask'][:self.max_length].clone()
+        prompt = self.prompts[idx]
+        response = self.responses[idx]
 
-        original_text = self.tokenizer.decode(input_ids, skip_special_tokens=True)
+        encoded_prompt = self.tokenizer(prompt, padding='max_length', truncation=True, max_length=self.max_length, return_tensors='pt')
+        encoded_response = self.tokenizer(response, padding='max_length', truncation=True, max_length=self.max_length, return_tensors='pt')
 
-        if np.random.rand() < 0.1:
-            replace_indices = np.random.choice(len(input_ids), size=2, replace=False)
-            for i in replace_indices:
-                input_ids[i] = np.random.randint(self.tokenizer.vocab_size)
+        input_ids = encoded_prompt['input_ids'].to(self.device)
+        attention_mask = encoded_prompt['attention_mask'].to(self.device)
 
-        inputs = {
-            'input_ids': input_ids.unsqueeze(0).to(self.device),
-            'attention_mask': attention_mask.unsqueeze(0).to(self.device)
-        }
         with torch.no_grad():
-            emb = self.embedder(**inputs).last_hidden_state.squeeze(0)
-
-        t = torch.randint(0, 1000, (1,)).item()
-        noise = torch.randn_like(emb)
-        noisy_emb = self._add_noise(emb, noise, t/1000)
+            prompt_emb = self.embedder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state.squeeze(0)
 
         return {
-            'L': noisy_emb.cpu(),
-            'L_target': emb.cpu(),
-            'mL': torch.randn_like(emb).cpu(),
-            'mL_target': emb.cpu(),
-            'prompt': emb.cpu(),
-            'text': input_ids.cpu(),
-            't': torch.tensor(t),
-            'original_text': original_text
+            'prompt_emb': prompt_emb.cpu(),
+            'response_ids': encoded_response['input_ids'].squeeze(0)
         }
 
-    def _add_noise(self, x, noise, alpha):
-        return alpha * x + (1 - alpha) * noise
-
-# === 核心模块定义 ===
+def load_everyday_conversations_ja(tokenizer, embedder, device, max_length=128):
+    dataset = load_dataset("U23-lab/everyday_conversations_ja", split="train")
+    prompts, responses = [], []
+    for i, row in enumerate(dataset):
+        if i >= len(dataset) * 0.05:  # 只取前5%的数据
+            break
+        try:
+            topic = row["topic"].strip()
+            user = row["user"].strip()
+            assistant = row["assistant"].strip()
+            if user and assistant:
+                prompts.append(f"{topic} | {user}")
+                responses.append(assistant)
+        except Exception as e:
+            logging.warning(f"Error in row: {row}, error: {e}")
+    logging.info(f"Loaded {len(prompts)} conversations")
+    return PreEmbedDataset(prompts, responses, tokenizer, embedder, device, max_length=max_length)
 
 class Denoiser(nn.Module):
-    def __init__(self, latent_dim, cond_dim):
+    def __init__(self, latent_dim, cond_dim, seq_len):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + cond_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
+        # 修改为处理嵌入的线性层
+        self.fc1 = nn.Linear(latent_dim + cond_dim, latent_dim)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(latent_dim, latent_dim)
+        self.seq_len = seq_len
 
     def forward(self, latent, cond):
+        # 在特征维度拼接嵌入 (假设 latent: [batch, seq_len, latent_dim])
         x = torch.cat([latent, cond], dim=-1)
-        return self.net(x)
+        x = self.act(self.fc1(x))
+        return latent + self.fc2(x)
 
 class MaskDecoder(nn.Module):
-    def __init__(self, latent_dim, num_experts):
+    def __init__(self, latent_dim, num_experts, seq_len):
         super().__init__()
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, num_experts)
-        )
+        # 输出每个专家的选择概率
+        self.fc = nn.Linear(latent_dim, num_experts)
+        self.seq_len = seq_len
 
     def forward(self, sL):
-        logits = self.decoder(sL)
-        mask = torch.softmax(logits, dim=-1)
-        return mask
+        return self.fc(sL)  # [batch, seq_len, num_experts]
 
 class Expert(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, seq_len):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
+        # 专家网络处理嵌入
+        self.fc = nn.Linear(latent_dim, latent_dim)
+        self.seq_len = seq_len
 
     def forward(self, x):
-        return self.net(x)
-
-# === 主模型结构 ===
+        return self.fc(x)
 
 class DiffusionTextModel(nn.Module):
-    def __init__(self, latent_dim, prompt_dim, num_experts, vocab_size, embedder):
+    def __init__(self, latent_dim, cond_dim, num_experts, vocab_size, seq_len, batch):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_experts = num_experts
-
-        self.qa = Denoiser(latent_dim, prompt_dim + latent_dim)
-        self.qb = Denoiser(latent_dim, prompt_dim + latent_dim)
-        self.qc = Denoiser(latent_dim, prompt_dim + latent_dim)
-
-        self.qk_pool = nn.ModuleList([Expert(latent_dim) for _ in range(num_experts)])
-        self.mask_decoder = MaskDecoder(latent_dim, num_experts)
-
+        self.qa = Denoiser(latent_dim, cond_dim, seq_len)
+        self.qb = Denoiser(latent_dim, cond_dim + latent_dim, seq_len)
+        self.qk_pool = nn.ModuleList([Expert(latent_dim, seq_len) for _ in range(num_experts)])
+        self.mask_decoder = MaskDecoder(latent_dim, num_experts, seq_len)
         self.text_decoder = nn.Linear(latent_dim, vocab_size)
-        
-        self.embedder = embedder
+        self.seq_len = seq_len
+        self.latent_dim = latent_dim
+        self.batch = batch
 
-    def forward(self, L, mL, prompt):
-        # mL 表示模型记忆，可视为对当前对话上下文的内隐表示
-        # prompt 表示当前输入（本轮对话）
+    def forward(self, prompt_emb, n_steps=1, mask_denoise_steps=1):
+        prompt_emb = prompt_emb.to("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 1. 用 mL 和 prompt 生成本轮的 L（内容生成基础）
-        L = self.qa(L, torch.cat([prompt, mL], dim=-1))
+        # 初始化潜在嵌入 (添加了序列长度维度)
+        L = torch.randn([prompt_emb.size(0), self.seq_len, self.latent_dim]).to(prompt_emb.device) * 0.02
 
-        # 2. 对 L 加噪，生成 sL，输入给 mask 解码器
-        sL = self.qb(torch.randn_like(L), torch.cat([prompt, L], dim=-1))
-        mask = self.mask_decoder(sL)
+        for _ in range(n_steps):
+            L = self.qa(L, prompt_emb)  # 去噪步骤1
 
-        # 3. 用 mask 混合多个专家输出
-        expert_outputs = []
-        for k, qk in enumerate(self.qk_pool):
-            out = qk(L)
-            expert_outputs.append(out.unsqueeze(-2))
-        expert_outputs = torch.cat(expert_outputs, dim=-2)
-        qk_output = (expert_outputs * mask.unsqueeze(-1)).sum(dim=-2)
+            # 生成mask的潜在表示
+            sL = torch.randn_like(L) * 0.02
+            for _ in range(mask_denoise_steps):
+                sL = self.qb(sL, torch.cat([prompt_emb.squeeze(1), L], dim=-1))
 
-        # 4. 再次精炼 L，同时保持 mL 参与其中
-        L = self.qa(qk_output, torch.cat([prompt, mL], dim=-1))
+            # 专家混合机制
+            mask = torch.softmax(self.mask_decoder(sL), dim=-1)  # [batch, seq_len, num_experts]
+            experts = torch.stack([qk(L) for qk in self.qk_pool], dim=2)  # [batch, seq_len, num_experts, latent_dim]
+            L = torch.einsum('bsk,bskd->bsd', mask, experts)  # 加权求和
 
-        # 5. 更新对话上下文记忆 mL
-        mL_pred = self.qc(mL, torch.cat([prompt, L], dim=-1))
+        # 最终输出logits
+        logits = self.text_decoder(L)  # [batch, seq_len, vocab_size]
+        return logits, mask
 
-        # 6. 最终解码生成文本
-        text_logits = self.text_decoder(L)
+# === 损失 ===
+def compute_loss(logits, targets, mask, expert_outputs, lambdas):
+    valid = (targets != 0) & (targets != 101) & (targets != 102)
+    loss_text = F.cross_entropy(logits.view(-1, logits.size(-1))[valid.view(-1)],
+                                targets.view(-1)[valid.view(-1)],
+                                ignore_index=0)
+    mask_probs = torch.softmax(mask, dim=-1)
+    loss_entropy = -(mask_probs * torch.log(mask_probs + 1e-8)).sum(dim=-1).mean()
+    usage = mask_probs.sum(dim=(0, 1))
+    usage = usage / (usage.sum() + 1e-8)
+    loss_diversity = ((usage - 1 / mask.size(-1)) ** 2).sum()
+    return lambdas['text'] * loss_text + lambdas['entropy'] * loss_entropy + lambdas['diversity'] * loss_diversity
 
-        return L, mL_pred, mask, text_logits, expert_outputs
+# === 训练 ===
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
+    embedder = AutoModel.from_pretrained(args.model_name, cache_dir=args.cache_dir).to(device).eval()
 
-# === 损失函数 ===
+    # 数据加载保持不变，允许batch_size > 1
+    dataset = load_everyday_conversations_ja(tokenizer, embedder, device, max_length=args.max_length)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
 
-def compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_target, mask, expert_outputs, lambda_dict):
-    loss_L = F.mse_loss(L_pred, L_target)
-    loss_mL = F.mse_loss(mL_pred, mL_target)
-    loss_text = F.cross_entropy(text_logits.view(-1, text_logits.size(-1)), text_target.view(-1))
+    model = DiffusionTextModel(embedder.config.hidden_size, embedder.config.hidden_size, args.num_experts, tokenizer.vocab_size, args.max_length, args.batch_size).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    lambdas = {'text': args.lambda_text, 'entropy': args.lambda_entropy, 'diversity': args.lambda_diversity}
 
-    loss_mask_entropy = (mask * torch.log(mask + 1e-8)).sum(dim=-1).mean()
+    scaler = torch.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available())
 
-    mask_usage = mask.sum(dim=1)
-    mask_usage = mask_usage / (mask_usage.sum(dim=-1, keepdim=True) + 1e-6)
-    loss_diversity = ((mask_usage.mean(dim=0) - 1.0/mask.size(-1))**2).sum()
-
-    i, j = 0, 1
-    ek1 = expert_outputs[:, :, i, :]
-    ek2 = expert_outputs[:, :, j, :]
-    loss_contrast = -F.cosine_similarity(ek1.detach(), ek2, dim=-1).mean()
-
-    total_loss = (loss_L +
-                  lambda_dict['mL'] * loss_mL +
-                  lambda_dict['text'] * loss_text +
-                  lambda_dict['entropy'] * loss_mask_entropy +
-                  lambda_dict['diversity'] * loss_diversity +
-                  lambda_dict['contrast'] * loss_contrast)
-
-    return total_loss
-
-# === 训练循环 ===
-
-def train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=100, previous_epoch=0, save_path="checkpoint"):
-    model.train()
-    os.makedirs(save_path, exist_ok=True)
-    for epoch in range(previous_epoch, num_epochs):
-        for batch in dataloader:
-            L = batch['L'].to(device)
-            mL = batch['mL'].to(device)
-            prompt = batch['prompt'].to(device)
-            text_target = batch['text'].to(device)
-            L_target = batch['L_target'].to(device)
-            mL_target = batch['mL_target'].to(device)
+    for epoch in range(args.epochs):
+        model.train()
+        for batch in loader:
 
             optimizer.zero_grad()
-            L_pred, mL_pred, mask, text_logits, expert_outputs = model(L, mL, prompt)
 
-            loss = compute_losses(L_pred, L_target, mL_pred, mL_target, text_logits, text_target, mask, expert_outputs, lambda_dict)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
+                # batch['prompt_emb']: (batch_size, seq_len, hidden_size)
+                # batch['response_ids']: (batch_size, seq_len)
 
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}: Loss = {loss.item():.4f}")
-            sample_prompt = batch['original_text'][:2]
-            sampled_texts = generate_text(model, sample_prompt, tokenizer, n_steps=20, device=device)
-            for i, txt in enumerate(sampled_texts):
-                print(f"[Prompt {i}] {sample_prompt[i]}")
-                print(f"[Generated {i}] {txt}")
+                # 拆解批次并逐个处理
+                batch_logits, batch_mask = [], []
+                for i in range(batch['prompt_emb'].size(0)):  # 遍历每个样本
+                    # 取出单个样本 (移除批次维度)
+                    prompt_emb = batch['prompt_emb'][i]  # (seq_len, hidden_size)
+                    targets = batch['response_ids'][i]   # (seq_len,)
 
-        if epoch % 20 == 0:
-            print(f"\n[Epoch {epoch}] Lambda weights: {lambda_dict}")
-            with torch.no_grad():
-                example_mask = mask[0]
-                for pos in range(min(3, example_mask.size(0))):
-                    weights = example_mask[pos].cpu().numpy()
-                    print(f"  Position {pos} expert weights: {weights}")
+                    # 模型前向 (无批次)
+                    logits, mask = model(prompt_emb.unsqueeze(0), n_steps=args.n_steps, mask_denoise_steps=args.mask_denoise_steps)
 
-        if epoch % 50 == 0  and epoch >= 100:
-            ckpt = os.path.join(save_path, f"model_epoch{epoch}.pt")
-            torch.save(model.state_dict(), ckpt)
-            print(f"Saved checkpoint to {ckpt}")
+                    # 保存结果（重新添加批次维度）
+                    batch_logits.append(logits.squeeze(0))  # (seq_len, vocab_size)
+                    batch_mask.append(mask.squeeze(0))     # (seq_len, num_experts)
 
-            print("Input a prompt within 20s to test generation (or wait to continue):")
-            print("Type 'exit' to stop prompt input and continue training.")
+                # 重新聚合批次
+                logits = torch.stack(batch_logits, dim=0)  # (batch_size, seq_len, vocab_size)
+                mask = torch.stack(batch_mask, dim=0)      # (batch_size, seq_len, num_experts)
+                targets = batch['response_ids'].to(device) # (batch_size, seq_len)
+
+                # 计算损失
+                loss = compute_loss(logits, targets, mask, None, lambdas)
+
+            # 反向传播
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+        if epoch % 1 == 0 and epoch > 0:
+            #torch.save(model.state_dict(), os.path.join(args.save_path, f"model_epoch{epoch}.pt"))
+            print(f"Epoch {epoch}: loss = {loss.item():.4f}")
+
+        if epoch % 2 == 0 and epoch > 0:
+            sample_prompt = "こんにちは。"
+            generated = generate_text(model, sample_prompt, tokenizer, embedder, device, args.n_steps)
+            print(f"[Prompt] {sample_prompt}")
+            print(f"[Generated] {generated}")
+
+        if epoch % 10 == 0 and epoch > 0:
+            print("Manual prompt input mode (20s timeout):")
             try:
                 start_time = time.time()
                 while True:
                     if time.time() - start_time > 20:
                         break
-                    prompt = input("Prompt: ")
+                    prompt = input("Prompt (or 'exit' to skip): ")
                     if prompt.strip().lower() == "exit":
                         break
                     if prompt.strip():
-                        result = generate_text(model, [prompt], tokenizer, n_steps=30, device=device)
-                        print("\nGenerated text:", result[0])
+                        result = generate_text(model, prompt, tokenizer, embedder, device, args.n_steps)
+                        print("[Generated]", result)
                         start_time = time.time()
             except Exception as e:
-                print("Prompting skipped.", e)
+                print("Manual prompt input skipped.", e)
+
 
 @torch.no_grad()
-def generate_text(model, prompt_texts, tokenizer, n_steps=10, device='cpu', temperature=1.0):
+def generate_text(model, prompt_text, tokenizer, embedder, device, n_steps=30, temperature=1.0, top_k=None, top_p=None):
     model.eval()
-    inputs = tokenizer(prompt_texts, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
-    prompt_emb = model.embedder(**inputs).last_hidden_state
+    inputs = tokenizer(prompt_text, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
+    prompt_emb = embedder(**inputs).last_hidden_state.squeeze(0)  # (seq_len, embed_dim)
+    seq_len, _ = prompt_emb.size()
 
-    # mL 初始化为空记忆；一次 session 中可复用
-    mL = torch.zeros_like(prompt_emb).to(device)
-    latent = torch.randn_like(prompt_emb).to(device)
+    prompt_emb = prompt_emb.repeat(model.batch, 1, 1)
 
-    for step in range(n_steps):
-        L = model.qa(latent, torch.cat([prompt_emb, mL], dim=-1))
-        sL = model.qb(torch.randn_like(L), torch.cat([prompt_emb, L], dim=-1))
-        mask = model.mask_decoder(sL)
+    latent_dim = model.qa.fc1.in_features - prompt_emb.size(-1)
+    latent = torch.randn(prompt_emb.size(0), seq_len, latent_dim, device=device)
 
-        expert_outputs = []
-        for k, qk in enumerate(model.qk_pool):
-            out = qk(L)
-            expert_outputs.append(out.unsqueeze(-2))
-        expert_outputs = torch.cat(expert_outputs, dim=-2)
-        qk_output = (expert_outputs * mask.unsqueeze(-1)).sum(dim=-2)
+    for _ in range(n_steps):
+        latent = model.qa(latent, prompt_emb)
+        sL = torch.randn_like(latent)
+        for _ in range(3):
+            sL = model.qb(sL, torch.cat([prompt_emb, latent], dim=-1))
+        mask_logits = model.mask_decoder(sL)
+        mask = torch.softmax(mask_logits, dim=-1)
 
-        latent = model.qa(qk_output, torch.cat([prompt_emb, mL], dim=-1))
-        mL = model.qc(mL, torch.cat([prompt_emb, latent], dim=-1))  # 更新记忆 mL
+        experts = torch.stack([qk(latent) for qk in model.qk_pool], dim=2)
+        latent = torch.einsum('bsk,bskd->bsd', mask, experts)
 
     logits = model.text_decoder(latent)
-    probs = torch.softmax(logits / temperature, dim=-1)
-    ids = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1).view(probs.size(0), -1)
-    texts = [tokenizer.decode(x.tolist(), skip_special_tokens=True) for x in ids]
-    return texts
+    logits = logits / temperature
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sample_pct", type=float, default=0.1)
-    parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--save_path", type=str, default="checkpoint")
-    parser.add_argument("--resume", action="store_false", help="Resume training from last checkpoint")
-    args = parser.parse_args()  
+    if top_k is not None:
+        top_k = max(top_k, 1)
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits = logits.masked_fill(indices_to_remove, float('-inf'))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", cache_dir="D:/my_data/hf_cache")
-    embedder = AutoModel.from_pretrained("bert-base-uncased", cache_dir="D:/my_data/hf_cache").to(device)
+    if top_p is not None:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        for i in range(logits.size(0)):
+            logits[i, sorted_indices[i][sorted_indices_to_remove[i]]] = float('-inf')
 
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1%]", cache_dir="D:/my_data/hf_cache")
-    
-    
-    tokenized = dataset.map(
-        lambda e: tokenizer(e['text'], truncation=True, padding="max_length", max_length=128),
-        batched=True,
-        remove_columns=['text']  # 可选，清理原始字段
-    ).with_format("torch")
-    diffusion_dataset = DiffusionDataset(tokenized, embedder, tokenizer, max_length=128, device=device, sample_pct=args.sample_pct)
-    dataloader = DataLoader(diffusion_dataset, batch_size=args.batch_size, shuffle=True)
+    probs = torch.softmax(logits, dim=-1)
+    generated_ids = torch.multinomial(probs[0], num_samples=1).squeeze(-1)
 
-    latent_dim = embedder.config.hidden_size
-    prompt_dim = latent_dim
-    num_experts = 12
-    vocab_size = tokenizer.vocab_size
-    model = DiffusionTextModel(latent_dim, prompt_dim, num_experts, vocab_size, embedder=embedder).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    lambda_dict = {
-        'mL': 1.0,
-        'text': 1.0,
-        'entropy': 0.1,
-        'diversity': 0.1,
-        'contrast': 0.1
-    }
-    
-    previous_epoch = 0
-    args.resume = False
-                
-    if args.resume:
-        ckpt_files = [f for f in os.listdir(args.save_path) if f.endswith(".pt")]
-        if ckpt_files:
-            # Extract epoch numbers and find the maximum
-            max_epoch = -1
-            latest_ckpt = None
-            for f in ckpt_files:
-                try:
-                    epoch = int(f.split("_")[-1].split(".")[0][5:])  # Assuming format like "model_epochXX.pt"
-                    if epoch > max_epoch:
-                        max_epoch = epoch
-                        latest_ckpt = f
-                except (IndexError, ValueError):
-                    continue
-            
-            if latest_ckpt:
-                latest_ckpt_path = os.path.join(args.save_path, latest_ckpt)
-                model.load_state_dict(torch.load(latest_ckpt_path))
-                print(f"✅ Resumed model from {latest_ckpt_path}")
-
-    train_model(model, dataloader, optimizer, lambda_dict, device, tokenizer, num_epochs=args.epochs + previous_epoch, previous_epoch=previous_epoch, save_path=args.save_path)
+    generated_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+    return generated_text
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="cl-tohoku/bert-base-japanese-v2")
+    parser.add_argument("--cache_dir", type=str, default="hf_cache")
+    parser.add_argument("--save_path", type=str, default="checkpoints")
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_experts", type=int, default=12)
+    parser.add_argument("--n_steps", type=int, default=2)
+    parser.add_argument("--mask_denoise_steps", type=int, default=4)
+    parser.add_argument("--lambda_text", type=float, default=1.0)
+    parser.add_argument("--lambda_entropy", type=float, default=0.1)
+    parser.add_argument("--lambda_diversity", type=float, default=0.1)
+
+    args = parser.parse_args([])
+    train(args)
