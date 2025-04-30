@@ -43,7 +43,7 @@ def load_everyday_conversations_ja(tokenizer, embedder, device, max_length=128):
     dataset = load_dataset("U23-lab/everyday_conversations_ja", split="train")
     prompts, responses = [], []
     for i, row in enumerate(dataset):
-        if i >= len(dataset) * 0.05:  # 只取前5%的数据
+        if i >= len(dataset) * 0.02:  # 只取前5%的数据
             break
         try:
             topic = row["topic"].strip()
@@ -141,69 +141,53 @@ def compute_loss(logits, targets, mask, expert_outputs, lambdas):
     return lambdas['text'] * loss_text + lambdas['entropy'] * loss_entropy + lambdas['diversity'] * loss_diversity
 
 # === 训练 ===
-def train(args):
+def train(args, start_epoch=0, target_epoch=1000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
     embedder = AutoModel.from_pretrained(args.model_name, cache_dir=args.cache_dir).to(device).eval()
 
-    # 数据加载保持不变，允许batch_size > 1
     dataset = load_everyday_conversations_ja(tokenizer, embedder, device, max_length=args.max_length)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
 
     model = DiffusionTextModel(embedder.config.hidden_size, embedder.config.hidden_size, args.num_experts, tokenizer.vocab_size, args.max_length, args.batch_size).to(device)
+
+    model_path = os.path.join(args.save_path, f"model_epoch{start_epoch}.pt")
+    if os.path.exists(model_path):
+        print(f"Loading model from: {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     lambdas = {'text': args.lambda_text, 'entropy': args.lambda_entropy, 'diversity': args.lambda_diversity}
-
     scaler = torch.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available())
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch + 1, target_epoch + 1):
         model.train()
         for batch in loader:
-
             optimizer.zero_grad()
-
             with torch.amp.autocast("cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-                # batch['prompt_emb']: (batch_size, seq_len, hidden_size)
-                # batch['response_ids']: (batch_size, seq_len)
-
-                # 拆解批次并逐个处理
-                batch_logits, batch_mask = [], []
-                for i in range(batch['prompt_emb'].size(0)):  # 遍历每个样本
-                    # 取出单个样本 (移除批次维度)
-                    prompt_emb = batch['prompt_emb'][i]  # (seq_len, hidden_size)
-                    targets = batch['response_ids'][i]   # (seq_len,)
-
-                    # 模型前向 (无批次)
-                    logits, mask = model(prompt_emb.unsqueeze(0), n_steps=args.n_steps, mask_denoise_steps=args.mask_denoise_steps)
-
-                    # 保存结果（重新添加批次维度）
-                    batch_logits.append(logits.squeeze(0))  # (seq_len, vocab_size)
-                    batch_mask.append(mask.squeeze(0))     # (seq_len, num_experts)
-
-                # 重新聚合批次
-                logits = torch.stack(batch_logits, dim=0)  # (batch_size, seq_len, vocab_size)
-                mask = torch.stack(batch_mask, dim=0)      # (batch_size, seq_len, num_experts)
-                targets = batch['response_ids'].to(device) # (batch_size, seq_len)
-
-                # 计算损失
+                prompt_embs = batch['prompt_emb'].to(device)
+                targets = batch['response_ids'].to(device)
+                logits, mask = model(prompt_embs, n_steps=args.n_steps, mask_denoise_steps=args.mask_denoise_steps)
                 loss = compute_loss(logits, targets, mask, None, lambdas)
 
-            # 反向传播
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-        if epoch % 1 == 0 and epoch > 0:
-            #torch.save(model.state_dict(), os.path.join(args.save_path, f"model_epoch{epoch}.pt"))
+        if epoch % 1 == 0:
             print(f"Epoch {epoch}: loss = {loss.item():.4f}")
+            
+        if epoch % 50 == 0:
+            os.makedirs(args.save_path, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(args.save_path, f"model_epoch{epoch}.pt"))
 
-        if epoch % 2 == 0 and epoch > 0:
+        if epoch % 2 == 0:
             sample_prompt = "こんにちは。"
             generated = generate_text(model, sample_prompt, tokenizer, embedder, device, args.n_steps)
             print(f"[Prompt] {sample_prompt}")
             print(f"[Generated] {generated}")
-
-        if epoch % 10 == 0 and epoch > 0:
+            
+        if epoch % 50 == 0 and epoch > 0:
             print("Manual prompt input mode (20s timeout):")
             try:
                 start_time = time.time()
@@ -219,7 +203,6 @@ def train(args):
                         start_time = time.time()
             except Exception as e:
                 print("Manual prompt input skipped.", e)
-
 
 @torch.no_grad()
 def generate_text(model, prompt_text, tokenizer, embedder, device, n_steps=30, temperature=1.0, top_k=None, top_p=None):
@@ -272,7 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="cl-tohoku/bert-base-japanese-v2")
     parser.add_argument("--cache_dir", type=str, default="hf_cache")
     parser.add_argument("--save_path", type=str, default="checkpoints")
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=100)  # 本轮新增训练 epoch 数
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -284,4 +267,18 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_diversity", type=float, default=0.1)
 
     args = parser.parse_args([])
-    train(args)
+
+    # === 自动加载已有模型参数 ===
+    os.makedirs(args.save_path, exist_ok=True)
+    existing_epochs = [
+        int(f.replace("model_epoch", "").replace(".pt", ""))
+        for f in os.listdir(args.save_path)
+        if f.startswith("model_epoch") and f.endswith(".pt")
+    ]
+    start_epoch = max(existing_epochs) if existing_epochs else 0
+    target_epoch = start_epoch + args.epochs
+
+    print(f"Resuming from epoch {start_epoch}, training to {target_epoch}.")
+
+    # 启动训练（带起始 epoch 参数）
+    train(args, start_epoch=start_epoch, target_epoch=target_epoch)
