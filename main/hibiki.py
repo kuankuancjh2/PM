@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 from datasets import load_dataset
 import argparse
 import os
@@ -67,8 +67,9 @@ class SinusoidalTimeEmbedding(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, latent_dim, cond_dim, time_dim, seq_len):
         super().__init__()
+        self.norm = nn.LayerNorm(latent_dim)
         self.fc1 = nn.Linear(latent_dim + cond_dim + time_dim, latent_dim)
-        self.act = nn.ReLU()
+        self.act = nn.GELU()
         self.fc2 = nn.Linear(latent_dim, latent_dim)
         self.seq_len = seq_len
 
@@ -78,14 +79,70 @@ class Denoiser(nn.Module):
         x = self.act(self.fc1(x))
         return latent + self.fc2(x)
 
+class TransformerDenoiser(nn.Module):
+    def __init__(self, latent_dim, cond_dim, time_dim, n_heads=4, n_layers=2, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(latent_dim + cond_dim + time_dim, latent_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim, nhead=n_heads, dropout=dropout, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(latent_dim)
+
+    def forward(self, latent, cond, t_embed):
+        """
+        latent: [B, L, D]
+        cond: [B, L, D]
+        t_embed: [B, 1, T] → expand to [B, L, T]
+        """
+        t_embed = t_embed.expand(-1, latent.size(1), -1)
+        x = torch.cat([latent, cond, t_embed], dim=-1)      # [B, L, D+C+T]
+        x = self.input_proj(x)                              # [B, L, D]
+        x = self.encoder(self.norm(x))                      # [B, L, D]
+        return latent + x                                   # 残差加回
+
+
 class MaskDecoder(nn.Module):
     def __init__(self, latent_dim, num_experts, seq_len):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, num_experts)
+        self.norm = nn.LayerNorm(latent_dim)
+        self.fc1 = nn.Linear(latent_dim, num_experts)
+        self.act1 = nn.GELU()
+        self.fc2 = nn.Linear(num_experts, num_experts)
+        self.act2 = nn.GELU()
+        self.fc3 = nn.Linear(num_experts, num_experts)
         self.seq_len = seq_len
+        self.weight_logits = nn.Parameter(torch.randn(3))  # [α, β, γ]
 
     def forward(self, sL):
-        return self.fc(sL)
+        sL0 = self.norm(sL)
+        sL1 = self.act1(self.fc1(sL0))     # [B, L, num_experts]
+        sL2 = self.act2(self.fc2(sL1))     # [B, L, num_experts]
+        sL3 = self.fc3(sL2)                # [B, L, num_experts]
+
+        w = torch.softmax(self.weight_logits, dim=0)  # [3]
+        return w[0] * sL1 + w[1] * sL2 + w[2] * sL3
+    
+class LatentDecoder(nn.Module):
+    def __init__(self, latent_dim, seq_len):
+        super().__init__()
+        self.norm = nn.LayerNorm(latent_dim)
+        self.fc1 = nn.Linear(latent_dim, latent_dim)
+        self.act1 = nn.GELU()
+        self.fc2 = nn.Linear(latent_dim, latent_dim)
+        self.act2 = nn.GELU()
+        self.fc3 = nn.Linear(latent_dim, latent_dim)
+        self.seq_len = seq_len
+        self.weight_logits = nn.Parameter(torch.randn(3))  # [α, β, γ]
+
+    def forward(self, sL):
+        sL0 = self.norm(sL)
+        sL1 = self.act1(self.fc1(sL0))     # [B, L, seq_len]
+        sL2 = self.act2(self.fc2(sL1))     # [B, L, seq_len]
+        sL3 = self.fc3(sL2)                # [B, L, seq_len]
+        
+        w = torch.softmax(self.weight_logits, dim=0)  # [3]
+        return w[0] * sL1 + w[1] * sL2 + w[2] * sL3
 
 class Expert(nn.Module):
     def __init__(self, latent_dim, seq_len):
@@ -102,9 +159,10 @@ class DiffusionTextModel(nn.Module):
         self.time_dim = time_dim
         self.time_embed = SinusoidalTimeEmbedding(time_dim)
         self.qa = Denoiser(latent_dim, cond_dim, time_dim, seq_len)
-        self.qb = Denoiser(latent_dim, cond_dim + latent_dim, time_dim, seq_len)
+        self.qb = TransformerDenoiser(latent_dim, cond_dim + latent_dim, time_dim)
         self.qk_pool = nn.ModuleList([Expert(latent_dim, seq_len) for _ in range(num_experts)])
         self.mask_decoder = MaskDecoder(latent_dim, num_experts, seq_len)
+        self.latent_decoder = LatentDecoder(latent_dim, seq_len)
         self.seq_len = seq_len
         self.latent_dim = latent_dim
 
@@ -126,9 +184,11 @@ class DiffusionTextModel(nn.Module):
             experts = torch.stack([qk(L) for qk in self.qk_pool], dim=2)
             L = torch.einsum('bsk,bskd->bsd', mask, experts)
 
-        return L, mask
+            logits = self.latent_decoder(L)
+            
+        return logits, mask
 
-def compute_loss(logits, targets, mask, expert_outputs, lambdas):
+def compute_loss(gpt2, logits, targets, mask, latent, lambdas):
     valid = (targets != 0) & (targets != 101) & (targets != 102)
     loss_text = F.cross_entropy(logits.view(-1, logits.size(-1))[valid.view(-1)],
                                 targets.view(-1)[valid.view(-1)],
@@ -147,7 +207,13 @@ def compute_loss(logits, targets, mask, expert_outputs, lambdas):
         repeat_ratio = 1.0 - (uniq / total)
         repeat_penalty += repeat_ratio
     repeat_penalty = repeat_penalty / preds.size(0)  # 平均重复率
-    return lambdas['text'] * loss_text + lambdas['entropy'] * loss_entropy + lambdas['diversity'] * loss_diversity + lambdas['repeat'] * repeat_penalty
+    with torch.no_grad():
+        gpt2_target_emb = unwrap(gpt2).transformer.wte(targets)  # [B, L, 1024]
+    latent_loss = F.mse_loss(latent, gpt2_target_emb)
+    return lambdas['text'] * loss_text + lambdas['entropy'] * loss_entropy + lambdas['diversity'] * loss_diversity + lambdas['repeat'] * repeat_penalty + lambdas['latent'] * latent_loss
+
+def unwrap(model):
+    return model.module if hasattr(model, "module") else model
 
 @torch.no_grad()
 def decode_latent_to_text(latent, gpt2_model, tokenizer, temperature=1.0):
@@ -165,6 +231,14 @@ def train(args):
     gpt2 = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     gpt2.resize_token_embeddings(tokenizer.vocab_size)
 
+    for name, param in gpt2.named_parameters():
+        if any(key in name for key in ["h.10", "h.11", "ln_f"]):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+            
+    gpt2 = nn.DataParallel(gpt2)
+
     dataset = load_everyday_conversations_ja(tokenizer, embedder, device, max_length=args.max_length, percentage=args.data_percentage)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
 
@@ -174,6 +248,8 @@ def train(args):
         num_experts=args.num_experts,
         seq_len=args.max_length,
     ).to(device)
+    
+    model = nn.DataParallel(model)
 
     os.makedirs(args.save_path, exist_ok=True)
     existing_epochs = [
@@ -188,10 +264,21 @@ def train(args):
     model_path = os.path.join(args.save_path, f"model_epoch{start_epoch}.pt")
     if os.path.exists(model_path):
         print(f"Loading model from: {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        unwrap(model).load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    lambdas = {'text': args.lambda_text, 'entropy': args.lambda_entropy, 'diversity': args.lambda_diversity}
+    lambdas = {'text': args.lambda_text, 'entropy': args.lambda_entropy, 'diversity': args.lambda_diversity, 'repeat': args.lambda_repeat, 'latent': args.lambda_latent}
+
+    num_training_steps = len(loader) * (target_epoch - start_epoch)
+    num_warmup_steps = int(num_training_steps * 0.04)  # 前10%为 warmup
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        num_cycles=0.5  # 半周期，代表衰减到最低再回升一点（可以调节）
+    )
+
 
     for epoch in range(start_epoch + 1, target_epoch + 1):
         model.train()
@@ -199,36 +286,56 @@ def train(args):
             optimizer.zero_grad()
             prompt_embs = batch['prompt_emb'].to(device)
             targets = batch['response_ids'].to(device)
-            latent, mask = model(prompt_embs, n_steps=args.n_steps, mask_denoise_steps=args.mask_denoise_steps)
-            logits = gpt2(inputs_embeds=latent).logits
+            logits, mask = model(prompt_embs, n_steps=args.n_steps, mask_denoise_steps=args.mask_denoise_steps)
+            gpt2_logits = gpt2(inputs_embeds=logits).logits
 
-            vocab_size = logits.size(-1)
-            valid = (targets != 0) & (targets != 101) & (targets != 102) & (targets < vocab_size)
-            loss_text = F.cross_entropy(logits.view(-1, vocab_size)[valid.view(-1)], targets.view(-1)[valid.view(-1)], ignore_index=0)
-
-            mask_probs = torch.softmax(mask, dim=-1)
-            loss_entropy = -(mask_probs * torch.log(mask_probs + 1e-8)).sum(dim=-1).mean()
-            usage = mask_probs.sum(dim=(0, 1))
-            usage = usage / (usage.sum() + 1e-8)
-            loss_diversity = ((usage - 1 / mask.size(-1)) ** 2).sum()
-
-            loss = lambdas['text'] * loss_text + lambdas['entropy'] * loss_entropy + lambdas['diversity'] * loss_diversity
+            loss = compute_loss(gpt2, gpt2_logits, targets, mask, logits, lambdas)
+            torch.nn.utils.clip_grad_norm_(unwrap(model).parameters(), max_norm=1.0)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
-        print(f"Epoch {epoch}: loss = {loss.item():.4f}")
+        print(f"Epoch {epoch}: loss = {loss.item():.4f}, lr = {scheduler.get_last_lr()[0]:.6f}")
+        
+        with torch.no_grad():
+            # 随机取一个 batch 做专家分析
+            batch_iter = iter(loader)
+            batch = next(batch_iter)
+            prompt_embs = batch['prompt_emb'].to(device)
+            latent, mask = model(prompt_embs, n_steps=args.n_steps, mask_denoise_steps=args.mask_denoise_steps)
+
+            # [B, L, num_experts]
+            mask_probs = torch.softmax(mask, dim=-1)
+
+            # === 统计专家平均使用率 ===
+            expert_usage = mask_probs.sum(dim=(0, 1))  # [num_experts]
+            expert_usage = expert_usage / expert_usage.sum()
+            usage_str = ", ".join([f"{u.item():.3f}" for u in expert_usage])
+            print(f"[Expert Usage] {usage_str}")
+
+            # === 检查专家输出之间的余弦相似度 ===
+            experts_latent = [qk(latent) for qk in unwrap(model).qk_pool]  # 每个为 [B, L, D]
+            avg_latent = [e.mean(dim=(0, 1)) for e in experts_latent]  # 每个为 [D]
+            sims = []
+            for i in range(len(avg_latent)):
+                for j in range(i + 1, len(avg_latent)):
+                    sim = F.cosine_similarity(avg_latent[i], avg_latent[j], dim=0).item()
+                    sims.append(sim)
+            if sims:
+                avg_sim = sum(sims) / len(sims)
+            print(f"[Expert Cosine Similarity Avg] {avg_sim:.4f}")
             
-        if epoch % 50 == 0:
+        if epoch % 15 == 0:
             os.makedirs(args.save_path, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(args.save_path, f"model_epoch{epoch}.pt"))
+            torch.save(unwrap(model).state_dict(), os.path.join(args.save_path, f"model_epoch{epoch}.pt"))
 
-        if epoch % 2 == 0:
+        if epoch % 1 == 0:
             sample_prompt = "こんにちは。"
             generated = generate(model, gpt2, tokenizer, embedder, sample_prompt, device)
             print(f"[Prompt] {sample_prompt}")
             print(f"[Generated] {generated}")
             
-        if epoch % 50 == 0 and epoch > 0:
+        if epoch % 30 == 0 and epoch > 0:
             print("Manual prompt input mode (20s timeout):")
             try:
                 start_time = time.time()
@@ -247,7 +354,10 @@ def train(args):
 
 
 @torch.no_grad()
-def generate(model, gpt2_model, tokenizer, embedder, prompt, device, max_length=128, n_steps=20, mask_denoise_steps=4):
+def generate(model, gpt2_model, tokenizer, embedder, prompt, device, max_length=128, n_steps=1, mask_denoise_steps=1):
+    model = unwrap(model)
+    gpt2_model = unwrap(gpt2_model)
+    
     model.eval()
     gpt2_model.eval()
     inputs = tokenizer(prompt, return_tensors='pt', padding='max_length', truncation=True, max_length=max_length).to(device)
@@ -261,18 +371,19 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="rinna/japanese-gpt2-medium")
     parser.add_argument("--cache_dir", type=str, default="hf_cache")
     parser.add_argument("--save_path", type=str, default="checkpoints")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--num_experts", type=int, default=12)
-    parser.add_argument("--n_steps", type=int, default=1)
-    parser.add_argument("--mask_denoise_steps", type=int, default=2)
+    parser.add_argument("--n_steps", type=int, default=2)
+    parser.add_argument("--mask_denoise_steps", type=int, default=3)
     parser.add_argument("--lambda_text", type=float, default=1.0)
     parser.add_argument("--lambda_entropy", type=float, default=0.1)
-    parser.add_argument("--lambda_diversity", type=float, default=0.1)
+    parser.add_argument("--lambda_diversity", type=float, default=0.2)
     parser.add_argument("--lambda_repeat", type=float, default=0.2)
-    parser.add_argument("--data_percentage", type=list, default=[0.2, 0.21])
+    parser.add_argument("--lambda_latent", type=float, default=0.1)
+    parser.add_argument("--data_percentage", type=list, default=[0.4, 0.42])
     args = parser.parse_args([])
 
     train(args)
